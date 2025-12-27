@@ -20,9 +20,13 @@ module cordic_tb_top;
 
     cordic_if #(.XY_W(16), .ANGLE_W(32)) vif (.clk(clk));
 
-    localparam int MODE = 1; // 0: rotation, 1: vectoring
+    localparam int MODE = 0; // 0: rotation, 1: vectoring
+    localparam int GAIN_COMP = 1
 
-    cordic_dut_uvm #(.MODE(MODE)) dut (
+    cordic_dut_uvm #(
+        .MODE(MODE),
+        .GAIN_COMP(GAIN_COMP)
+    ) dut (
         .clk(clk),
         .rst_n(vif.rst_n),
         .in_valid(vif.in_valid),
@@ -59,7 +63,7 @@ module cordic_tb_top;
 
         cfg = cordic_cfg::type_id::create("cfg");
         cfg.mode = (MODE == 0) ? CORDIC_ROT : CORDIC_VEC;
-        cfg.gain_comp = 0;
+        cfg.gain_comp = GAIN_COMP;
         cfg.tol_xy_lsb = 10; // adjust as needed for tolerance (accumulated error due to quantization)
         cfg.tol_theta_lsb = 600000; // adjust as needed for tolerance (off by ~0.09 degrees)
         uvm_config_db #(cordic_cfg)::set(uvm_root::get(), "*", "cfg", cfg);
