@@ -1,118 +1,183 @@
 # Pipelined CORDIC Trigonometric & Vector Processing IP Core
-## Overview
-This repo contains a synthesizable, parameterizable **CORDIC IP core** implemented in SystemVerilog with **two operating modes**:
 
-- **Rotation mode**: computes **sin/cos** for an input angle by rotating an input vector.
-- **Vectoring mode**: computes **atan2(y,x)** and **magnitude** by driving the Y component toward zero.
+A synthesizable, parameterizable **CORDIC (COordinate Rotation DIgital Computer)** IP written in **SystemVerilog**. Built as an FPGA-friendly block with **ready/valid streaming**, **stallable pipelining (backpressure)**, and **numeric-quality knobs** (guard bits + optional gain compensation).
 
-The design is built as a reusable IP block with **ready/valid streaming interfaces**, **pipeline stall support**, and **numeric-quality enhancements** (guard bits + optional gain compensation). It has been implemented on a Xilinx Artix-7 FPGA (Basys3) @ 100MHz and produced accurate calculation across various inputs on real-time hardware.
+> Implemented on a **Digilent Basys 3 (Xilinx Artix-7)** at **100 MHz** and validated with real-time on-board results.
+
+## Project Overview
+This repository contains a CORDIC engine with two top-level modules:
+
+- **Rotation mode — `cordic_rotator.sv`**  
+  Computes **`cosine`** and **`sine`** by rotating an input vector `(x_start, y_start)` by a signed fixed-point angle `angle`.
+
+- **Vectoring mode — `cordic_vectoring.sv`**  
+  Computes **`theta = atan2(y, x)`** and **`mag = hypot(x, y)`** by iteratively driving `y -> 0`.
+
+Both modes reuse the same pipelined micro-rotation stage (`cordic_stage.sv`), which makes the design easy to extend and keeps behavior consistent across modes.
 
 ---
 
 ## Key Features
+### RTL Building Blocks
+- **CORDIC pipeline stage — `cordic_stage.sv`**  
+  - One micro-rotation per stage with a shift-by-`i` datapath. Supports **ROTATION** and **VECTORING** via a `MODE` parameter (shared stage RTL, different update equations).
 
-### CORDIC Modes
-- **Rotation (Trig)**
-  - Inputs: `(x_start, y_start, angle)`
-  - Outputs: `(cosine, sine)` = rotated vector components
-- **Vectoring (atan2 + Magnitude)**
-  - Inputs: `(x_start, y_start)`
-  - Outputs: `theta = atan2(y,x)`, `mag = hypot(x,y)` (optionally gain-compensated)
+- **Preprocessing**
+  - **`cordic_preproc.sv` (rotation)**: full-range angle normalization + quadrant mapping so the iterative angle stays within the convergence range.
+  - **`cordic_preproc_vec.sv` (vectoring)**: input normalization for correct **atan2** quadrant results (including `x < 0` correction via `±π` seeding).
 
-### Numeric Quality
-- **Guard bits** (`GUARD`): wider internal datapath prevents overflow / improves accuracy
-- **Optional gain compensation** (`GAIN_COMP`)
-  - Rotation: post-scales outputs by `1/K` (constant multiply) so amplitude matches the input vector
-  - Vectoring: post-scales magnitude by `1/K` so `mag ≈ hypot(x,y)`
-- Parameterized precision:
-  - `XY_W` (input/output width)
-  - `ANGLE_W` (angle width; default 32-bit “turns” format)
-  - `ITER` (iteration/stage count)
+- **Shared package — `cordic_pkg.sv`**
+  - `atan` LUT constants
+  - angle constants (`π`, `π/2`) in the chosen fixed-point format
+  - gain compensation constant (`1/K`)
 
-### Full-Range Angle Handling
-- Rotation mode includes **angle normalization/quadrant mapping** for **full 0–2π** coverage using signed arithmetic (`±π/2` offsets).
-- Vectoring mode uses **pre-rotation into the right half-plane** (`x0 >= 0`) and seeds `z0` with `0 / ±π / ±π/2` as needed for correct `atan2()` quadrants.
+### Interfaces & Integration
+- **Streaming handshake**:
+  - Inputs: `in_valid/in_ready`
+  - Outputs: `out_valid/out_ready`
+- **Backpressure/stall support**:
+  - If `out_valid=1` and `out_ready=0`, the core **stalls** and **holds all pipeline state** using clock-enable gating.
+  - `in_ready` deasserts during stall so no inputs are accepted/dropped incorrectly.
 
-### Interfaces
-- **Ready/valid handshake**: `in_valid/in_ready` and `out_valid/out_ready`
-- **Backpressure support**: pipeline **stalls** when `out_ready=0` (state held via clock-enable gating)
-- **1 sample/cycle throughput:** when pipeline not stalled and after pipeline fill
+### Numeric Quality Options
+- **Guard bits — `GUARD`**  
+  Widens internal X/Y datapath for headroom and reduced overflow risk.
+- **Optional gain compensation — `GAIN_COMP`**
+  - Rotation: post-scales `cos/sin` by `1/K` to preserve amplitude
+  - Vectoring: post-scales `mag` by `1/K` to return true `hypot(x, y)`
+- Parameterized:
+  - `XY_W` (data width)`ANGLE_W` (angle width), `ITER` (iteration count), `GUARD`, `GAIN_COMP`
+
+### Full-Range Handling
+- **Rotation:** quadrant-based normalization for full **0 to 2π** angle coverage  
+- **Vectoring:** correct **atan2** behavior across all quadrants via right-half-plane normalization and `z0` seeding
+
+---
+
+## Repository Structure
+```
+├── sim/
+│ ├── Include/
+│ │ └── cordic.include # file list / include setup (tool dependent)
+│ └── Testbench/ # UVM verification environment
+│   ├── agent/ # driver, monitor, sequencer
+│   ├── env/ # env + scoreboard (with golden models to test outputs)
+│   ├── sequences/ # directed + randomized sequences (rotator/vectoring/pipeline)
+│   ├── tb/ # top-level testbench (interfaces, clock/reset, etc.)
+│   ├── tests/ # UVM tests
+│   ├── MakefileUVM # make targets for simulation runs
+│   └── link_files_uvm.py # helper script to link/collect sources
+│
+├── src/
+│ ├── constraint/ # constraints (used for FPGA implementation)
+│ ├── interfaces/ # SystemVerilog interfaces (ready/valid, etc.)
+│ ├── packages/ # cordic_pkg that contains shared types/constants
+│ ├── rtl/ # synthesizable RTL sources (rotator/vectoring/stages/preproc)
+│ └── script/ # project's TCL script (create/build entire project flow in Xilinx Vivado)
+│
+├── LICENSE
+├── .gitignore
+├── README.md
+└── README_UVM.md
+```
 
 ---
 
 ## Architecture Details
+### How the Pipeline is Created
+This is a real pipeline because each stage registers its outputs and stages are wired in sequence:
 
-### Angle Format
-The default `ANGLE_W=32` uses a **“turns” phase accumulator** format:
+- Each `cordic_stage` has an `always_ff` register boundary.
+- A `generate for` loop creates `ITER` stages and connects stage `i -> i+1`.
 
-- `2^ANGLE_W` represents **one full rotation (2π / 360°)**
-- For `ANGLE_W=32`:
-  - `π = 0x8000_0000`
-  - `π/2 = 0x4000_0000`
+Data flows like this: (preproc regs) → stage0 regs → stage1 regs -> … -> stage(ITER-1) regs -> outputs
 
-This format makes wrapping and quadrant detection efficient and synthesizable.
+With `ITER=16`, the stage index is `i = 0..15` (16 total stages).
 
-### Pipeline Datapath
-The core is implemented as a pipeline:
+The tap arrays are sized `[0:ITER]` because there are **ITER+1 pipeline boundaries**:
+- `x_pipe[0]` is the preprocessed input
+- `x_pipe[ITER]` is the final stage output
 
-- A **preprocessing stage** registers `(x0, y0, z0)` on input accept.
-- A `generate for` loop instantiates `ITER` copies of `cordic_stage`.
-- Each stage contains an `always_ff` register boundary, so every cycle data advances one stage (when not stalled).
+### Backpressure / Stall Behavior
+- `stall = out_valid && !out_ready`
+- When stalled, all pipeline registers are gated with `ce = !stall`
+- Outputs remain stable until the downstream consumer asserts `out_ready`
 
-Dataflow conceptually: (preproc regs) -> stage0 regs -> stage1 regs -> ... -> stage(ITER-1) regs -> outputs
-
-### Stall / Backpressure
-When `out_valid=1` and `out_ready=0`, the core asserts `stall` and:
-- Deasserts `in_ready`
-- Freezes the entire pipeline with clock-enable gating (`ce = !stall`)
-- Holds outputs stable until the downstream accepts the sample
-
-### Mode Selection
-Rotation vs vectoring is implemented by using the **same stage module** with different update equations:
-
-- **Rotation mode**: direction `d` derived from `sign(z)`
-- **Vectoring mode**: direction `d` derived from `sign(y)`
-
-This maximizes code reuse and keeps both modes behaviorally aligned.
-
-### Gain Compensation
-CORDIC outputs are scaled by the gain `K`. When enabled, gain compensation multiplies by `1/K` using a fixed-point constant (e.g., Q1.15) and shifts back down. This is implemented as a **pure combinational post-processing step** from the final pipeline register tap (so it remains stall-stable).
+### Shared Stage for Two Modes
+The same `cordic_stage` module supports both modes by switching the direction selection and update equations:
+- **Rotation:** direction derived from `sign(z)` (drives residual angle -> 0)
+- **Vectoring:** direction derived from `sign(y)` (drives y -> 0)
 
 ---
 
-## Verification
+## Functional Verification
 
-### Testbenches
-- **`tb_cordic_rotator.sv`**
-  - Sweeps multiple angles across quadrants (including >180° cases)
-  - Compares outputs to `sin()` / `cos()` reference model
-  - Includes X-detection and optional randomized `out_ready` backpressure
+### UVM Verification Environment
+Functional verification is implemented with a constrained-random **UVM** testbench that includes:
+- Directed tests for known angles/quadrants and axis cases
+- Constrained-random stimulus for broad coverage
+- Randomized backpressure (`out_ready` toggling) to stress stall/hold behavior
+- Scoreboard golden models using `sin/cos/atan2/sqrt` reference math
 
-- **`tb_cordic_vectoring.sv`**
-  - Tests all quadrants and axis cases (x=0, y=0)
-  - Compares outputs to `atan2()` and `sqrt(x^2+y^2)` reference model
-  - Includes wrap-aware angle difference checking (±π normalization)
-  - Includes randomized `out_ready` backpressure
+### What is Verified
+- `sin/cos` correctness across the full angle range (including quadrant boundaries)
+- `atan2` correctness across all quadrants (including `x < 0` and axis cases)
+- magnitude correctness with and without gain compensation
+- ready/valid protocol correctness under stalls (no drops, stable outputs while stalled)
 
-- **UVM Verification Environment**
-  - Constrained-random sequences to test both modes (checked against golden modules in the `cordic_sb.sv`)
-  - Currently achieving ~80-85% code coverage in Cadence Xcelium, plan to refine/enhance the environment to obtain higher coverage (~90-95%) and readability in the future
+See **`README_UVM.md`** for test details and how to run regressions.
 
+---
+
+## Performance Metrics
+
+Implemented on **Digilent Basys 3 (Xilinx Artix-7)** using Xillinx Vivado Design Suite:
+
+- **Throughput:** 1 sample/cycle (after pipeline fill, when not stalled)
+- **Clock:** 100 MHz
+- **Resources (typical):**
+  - LUTs: ~1,000
+  - FFs: ~1,200
+  - DSPs: 0
+  - BRAMs: 0
+
+> Resource use vary with `XY_W`, `ITER`, `GUARD`, and whether gain compensation is enabled.
+
+---
+
+## Practical Applications
+
+This CORDIC IP is handy anywhere you need **trig**, **vector magnitude**, or **angle extraction** in hardware with predictable latency and clean streaming integration. While modern FPGAs have DSP blocks, CORDIC still earns its spot when you **don’t want to waste DSPs** on sin/cos or atan2—especially in designs where DSPs are reserved for filters, MAC-heavy kernels, or ML workloads.
+
+Examples:
+- **Digital communications / SDR**
+  - NCO/LO generation (sin/cos)
+  - I/Q rotation for phase and frequency correction
+  - Polar conversion (I/Q -> magnitude/phase) for demodulation and tracking loops
+
+- **Motor control / power electronics**
+  - Field-oriented control (FOC) transforms (sin/cos rotations)
+  - Encoder/resolver processing (atan2 + magnitude)
+
+- **Robotics / navigation**
+  - Convert vectors to heading + speed (atan2 + magnitude)
+  - Sensor processing pipelines that need repeated angle/magnitude ops
+
+- **Imaging / computer vision**
+  - Gradient magnitude + orientation (atan2) for feature extraction
+ 
 ---
 
 ## Known Limitations
-
-- **Fixed-point rounding/saturation**: final output slicing currently truncates. (Optional rounding/saturation can be added for improved numerical behavior.)
-- **Iteration/LUT depth**: `ITER` must not exceed the number of available `atan_lut()` entries unless extended.
-- **Vectoring input corner case**: `(x,y)=(0,0)` has undefined angle (`atan2(0,0)`); magnitude handling can be defined, but theta is mathematically ambiguous.
-- **Magnitude scaling convention**: when `GAIN_COMP=0`, vectoring magnitude is approximately `K * hypot(x,y)`; when `GAIN_COMP=1`, magnitude is approximately `hypot(x,y)`.
+- **Output truncation:** final outputs are typically truncated to `XY_W`; rounding/saturation is optional (and can be improved).
+- **LUT depth:** `ITER` must not exceed the number of entries in `atan_lut()` unless the LUT is extended/generated.
+- **Scaling convention:**
+  - `GAIN_COMP=0`: outputs include CORDIC gain `K`
+  - `GAIN_COMP=1`: post-scaled by `1/K` to match expected amplitude/magnitude
 
 ---
 
 ## Future Improvements
-
-- **Rounding + saturation** on output conversion to `XY_W`
-- **Configurable angle formats** (e.g., Q-format radians) via package helpers
-- **Shared unified top-level module** with runtime `mode` input (ROT/VEC selectable per transaction)
-- **Extended LUT generation** (auto-generate atan table for arbitrary `ITER`)
-- **Formal properties** for handshake correctness and pipeline stall
+- Add **round-to-nearest + saturation** on final output formatting
+- Auto-generate the `atan` LUT for arbitrary `ITER`
+- Expand into **formal verification** using **SystemVerilog Assertions (SVA)** for handshake + stall
