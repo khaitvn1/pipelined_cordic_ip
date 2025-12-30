@@ -125,7 +125,7 @@ Functional verification is implemented with a constrained-random **UVM** testben
 - magnitude correctness with and without gain compensation
 - ready/valid protocol correctness under stalls (no drops, stable outputs while stalled)
 
-See **`README_UVM.md`** for test details and how to run regressions.
+See **`README_UVM.md`** for more details and how to run the tests.
 
 ---
 
